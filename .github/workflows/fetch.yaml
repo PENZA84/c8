@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/fetch.yaml'
       - 'w38.py'
+      - 'config.yaml'
   workflow_dispatch:
   schedule:
     # 北京时间每天 00:00 和 12:00 运行 (UTC 16:00 和 04:00)
