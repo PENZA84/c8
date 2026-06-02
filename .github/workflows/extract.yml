@@ -7,7 +7,6 @@ on:
       - 'converter.py'
       - 'latest.yaml'
   schedule:
-    # 北京时间每天 08:00 运行 (UTC 00:00)
     - cron: '0 0 * * *'
   workflow_dispatch:
 
@@ -15,7 +14,7 @@ jobs:
   extract:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须赋予写入权限以提交代码
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,9 +39,9 @@ jobs:
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
           
-          # 检查是否有文件更新
-          if [ -n "$(git status --porcelain all_nodes.yaml all_nodes.txt)" ]; then
-            git add all_nodes.yaml all_nodes.txt
+          # 检查 all_nodes.yaml 和 output/ 目录是否有变动
+          if [ -n "$(git status --porcelain all_nodes.yaml output/)" ]; then
+            git add all_nodes.yaml output/
             git commit -m "Auto-update nodes: $(date '+%Y-%m-%d %H:%M:%S')"
             git push
           else
