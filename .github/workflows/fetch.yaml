@@ -1,0 +1,56 @@
+name: Fetch Subscriptions
+
+on:
+  push:
+    paths:
+      - '.github/workflows/generate_nodes.yml' # 监控工作流文件改动
+      - 'main.py'                            # 监控脚本改动
+  workflow_dispatch:
+  schedule:
+    # 北京时间每天 00:00 和 12:00 运行 (UTC 16:00 和 04:00)
+    - cron: '0 16 * * *'
+    - cron: '0 4 * * *'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须赋予写入权限
+      
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install pyyaml requests loguru tqdm retry
+
+      - name: 执行任务
+        run: |
+          python w38.py
+
+      - name: 提交并推送更改
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 清理环境，确保没有冲突
+          git reset --hard HEAD
+          git clean -fd
+          git pull --rebase origin main
+          
+          git add .
+          if git diff --quiet --staged; then
+            echo "无更改需要提交"
+            exit 0
+          fi
+          
+          git commit -m "🍀 自动更新订阅 $(date '+%Y-%m-%d %H:%M:%S')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
