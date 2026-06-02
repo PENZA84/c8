@@ -4,6 +4,7 @@ import threading
 import base64
 import requests
 import csv
+import queue
 from loguru import logger
 from tqdm import tqdm
 from retry import retry
@@ -17,229 +18,113 @@ from collections import defaultdict
 new_sub_list = []
 new_clash_list = []
 new_v2_list = []
-# 存储频道统计：{channel_url: [url_count, node_count, total_score]}
-channel_stats_map = defaultdict(lambda: [0, 0, 0])
-url_source = {}         # 存储 URL 来源：{url: set([channel_url, ...])}
-valid_url_set = set()   # 确保有效订阅只计数一次
+all_nodes_list = []  # 最终提取的节点内容
+processed_urls = set()
+url_queue = queue.Queue()
 
 lock = threading.Lock()
 max_concurrency = threading.Semaphore(64)
+MAX_URLS = 10000  # 防止递归无限扩散
 
-# ⚡ session + 连接池优化
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100,
-    pool_maxsize=100,
-    max_retries=0
-)
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=0)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
-
 
 # ======================
 # 工具函数
 # ======================
-def is_future(timestamp):
-    if len(str(timestamp)) >= 13:
-        timestamp = timestamp / 1000
-    return timestamp > datetime.now().timestamp()
-
-
-def filter_base64(text):
-    return any(x in text for x in [
-        'vless://', 'hy2://', 'hysteria2://', 'hysteria://', 'tuic://'
-    ])
-
+def is_valid_protocol(text):
+    # 严格排除 vmess/trojan，仅保留指定协议
+    return any(x in text for x in ['vless://', 'hy2://', 'hysteria2://', 'hysteria://', 'tuic://'])
 
 def safe_b64_decode(data):
     try:
         data = data.strip()
         pad = '=' * (-len(data) % 4)
-        return base64.b64decode(data + pad, validate=False)
+        return base64.b64decode(data + pad, validate=False).decode(errors='ignore')
     except:
-        return b''
-
-def convert_github_url(url):
-    """优化后的 GitHub 链接转换逻辑"""
-    if "github.com" not in url or "raw.githubusercontent.com" in url:
-        return url
-    if "/blob/" in url:
-        return url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-    return url
-
+        return ""
 
 # ======================
-# 配置读取
+# 核心：订阅深度解析
 # ======================
 @logger.catch
-def get_config():
-    with open('./config.yaml', encoding="UTF-8") as f:
-        data = yaml.load(f, Loader=yaml.FullLoader)
-    new_list = []
-    for url in data['tgchannel']:
-        a = url.split("/")[-1]
-        channel_full_url = 'https://t.me/s/' + a
-        new_list.append(channel_full_url)
-        _ = channel_stats_map[channel_full_url]
-    return new_list
-
-
-# ======================
-# 抓取频道内容
-# ======================
-@logger.catch
-def get_channel_http(channel_url):
+def process_subscription(url, bar):
+    headers = {'User-Agent': 'clash-verge/v2.0.2'}
     try:
-        res = session.get(channel_url, timeout=10)
-        data = res.text
-
-        url_list = re.findall(
-            r"https?://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]",
-            data
-        )
-
-        text_list = re.findall(
-            r"vless://[^\s<]+|hy2://[^\s<]+|hysteria2://[^\s<]+|hysteria://[^\s<]+|tuic://[^\s<]+",
-            data
-        )
-
-        logger.info(f"{channel_url} | URL: {len(url_list)} | 节点: {len(text_list)} | 获取成功")
+        res = session.get(url, headers=headers, timeout=8)
+        if res.status_code != 200: return
+        
+        content = res.text
+        
+        # 1. 解码 Base64 并提取节点
+        decoded_content = safe_b64_decode(content)
+        if decoded_content:
+            # 提取节点
+            nodes = re.findall(r'(vless://|hy2://|hysteria2://|hysteria://|tuic://)[^\s|]+', decoded_content)
+            if nodes:
+                with lock:
+                    all_nodes_list.extend([n for n in nodes if is_valid_protocol(n)])
+                    new_v2_list.append(url)
+        
+        # 2. 如果是 Clash YAML，提取节点信息
+        if 'proxies:' in content:
+            with lock: new_clash_list.append(url)
+        
+        # 3. 递归挖掘：提取其中的 URL 并按白名单过滤
+        allow_list = ['sub', 'subscribe', 'proxy', 'proxies', 'raw.githubusercontent.com', 'tt.vg', 'shz.al']
+        found_links = re.findall(r'https?://[^\s"\'<>]+', content)
         
         with lock:
-            channel_stats_map[channel_url][0] = len(url_list)
-            channel_stats_map[channel_url][1] = len(text_list)
-            
-        return url_list, text_list
-
-    except Exception as e:
-        logger.warning(channel_url + '\t获取失败')
-        logger.error(str(e))
-        return [], []
-
-
-# ======================
-# 节点检测（核心）
-# ======================
-@logger.catch
-def sub_check(url, bar):
-    headers = {'User-Agent': 'clash-verge/v2.0.2'}
-
-    with max_concurrency:
-        @retry(tries=2)
-        def start_check(url):
-            try:
-                res = session.get(url, headers=headers, timeout=5)
-            except:
-                return
-
-            if res.status_code != 200:
-                return
-
-            score = 0
-            is_valid = False
-            try:
-                # 累积证据模型：检查订阅信息 (Sub权重: 5)
-                info = res.headers.get('subscription-userinfo')
-                if info:
-                    match = re.search(r"expire=(\d+)", info)
-                    traffic = re.search(r"upload=(\d+); download=(\d+); total=(\d+)", info)
-                    upload = download = total = 0
-                    if traffic:
-                        upload, download, total = map(int, traffic.groups())
-                    remain = total - (upload + download)
-                    if remain > 1073741824:
-                        score += 5
-                        is_valid = True
-                        with lock: new_sub_list.append(url)
-                    
-                # 累积证据模型：检查 Clash 配置 (Clash权重: 3)
-                if 'proxies:' in res.text:
-                    score += 3
-                    is_valid = True
-                    with lock: new_clash_list.append(url)
-
-                # 累积证据模型：检查节点内容 (V2/节点权重: 2)
-                decoded = safe_b64_decode(res.text[:80])
-                if decoded:
-                    text = decoded.decode(errors='ignore')
-                    if filter_base64(text):
-                        score += 2
-                        is_valid = True
-                        with lock: new_v2_list.append(url)
-                
-                # 统计有效订阅，确保去重并累加总质量分
-                if is_valid:
-                    with lock:
-                        if url not in valid_url_set:
-                            valid_url_set.add(url)
-                            for source_channel in url_source.get(url, []):
-                                channel_stats_map[source_channel][2] += score
-            except:
-                pass
-
-        start_check(url)
-
-    with lock:
-        bar.update(1)
-
+            if len(processed_urls) < MAX_URLS:
+                for link in found_links:
+                    clean_link = link.strip().rstrip(')')
+                    if any(x in clean_link for x in allow_list) and clean_link not in processed_urls:
+                        processed_urls.add(clean_link)
+                        url_queue.put(clean_link)
+    except:
+        pass
+    
+    with lock: bar.update(1)
 
 # ======================
 # 主程序
 # ======================
 if __name__ == '__main__':
-    dict_url = {"机场订阅": [], "clash订阅": [], "v2订阅": []}
-    list_tg = get_config()
-    logger.info('读取config成功')
+    # 1. 读取 latest.yaml 并填入队列
+    try:
+        with open('latest.yaml', 'r', encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            for key, urls in data.items():
+                for url in urls:
+                    if url not in processed_urls:
+                        processed_urls.add(url)
+                        url_queue.put(url)
+        logger.info(f'从 latest.yaml 加载了 {url_queue.qsize()} 个订阅源')
+    except FileNotFoundError:
+        logger.warning('未找到 latest.yaml，请先运行基础抓取脚本')
 
-    url_list = []
-    proxy_list = []
-    allow_list = ['sub', 'clash', 'paste', 'tt.vg', 'shz.al', 'proxies', 'raw.githubusercontent.com', 'github.com']
-    deny_list = ['https://t.me/']
-
-    for channel_url in list_tg:
-        temp_url_list, temp_text_list = get_channel_http(channel_url)
-        for url in temp_url_list:
-            if any(x in url for x in allow_list) and all(x not in url for x in deny_list):
-                clean_url = convert_github_url(url)
-                url_list.append(clean_url)
-                with lock:
-                    if clean_url not in url_source:
-                        url_source[clean_url] = set()
-                    url_source[clean_url].add(channel_url)
-        proxy_list.extend(temp_text_list)
-
-    url_list = list(set(url_list))
-    logger.info('开始筛选---')
-
-    bar = tqdm(total=len(url_list), desc='订阅筛选：', mininterval=0.2)
+    # 2. 开始深度递归解析
+    bar = tqdm(total=url_queue.qsize(), desc='深度解析中')
     threads = []
-    for url in url_list:
-        t = threading.Thread(target=sub_check, args=(url, bar))
-        t.daemon = True
+    
+    while not url_queue.empty():
+        url = url_queue.get()
+        t = threading.Thread(target=process_subscription, args=(url, bar))
         t.start()
         threads.append(t)
-    for t in threads:
-        t.join()
+        
+        # 简单控制并发，防止线程过多
+        if len(threads) > 32:
+            for t in threads: t.join()
+            threads = []
+
+    for t in threads: t.join()
     bar.close()
-    logger.info('筛选完成')
 
-    # 导出统计CSV
-    with open('channel_stats.csv', 'w', encoding='utf-8-sig', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['频道URL', 'URL数量', '节点数量', '有效资源质量分'])
-        for chan, stats in channel_stats_map.items():
-            writer.writerow([chan] + stats)
-    logger.info('统计表 channel_stats.csv 已生成')
-
-    dict_url.update({
-        '机场订阅': sorted(set(new_sub_list)),
-        'clash订阅': sorted(set(new_clash_list)),
-        'v2订阅': sorted(set(new_v2_list))
-    })
-
-    with open('latest.yaml', 'w', encoding="utf-8") as f:
-        yaml.dump(dict_url, f, allow_unicode=True)
-    with open('url.txt', 'w', encoding="utf-8") as f:
-        f.writelines([u + '\n' for u in url_list])
-    with open('v2ray.txt', 'w', encoding="utf-8") as f:
-        f.writelines([unquote(u) + '\n' for u in proxy_list])
+    # 3. 导出所有提取到的节点
+    with open('all_nodes.txt', 'w', encoding="utf-8") as f:
+        f.write('\n'.join(set(all_nodes_list)))
+    
+    logger.info(f'解析完成。已提取节点数: {len(all_nodes_list)}，已保存至 all_nodes.txt')
