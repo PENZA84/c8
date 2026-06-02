@@ -1,70 +1,152 @@
 import yaml
-import urllib.parse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import hashlib
+import os
 
 # ======================
 # 配置
 # ======================
-ALLOWED_PROTOCOLS = ('vless://', 'hy2://', 'hysteria2://', 'hysteria://', 'tuic://')
+DEBUG = True
+ALLOWED_PROTOCOLS = ('vless', 'hy2', 'hysteria2', 'hysteria', 'tuic')
 
-def format_hysteria2(node):
-    """还原 hysteria2 完整 URI"""
+# 支持的查询参数白名单（可扩展）
+ALLOWED_PARAMS = {
+    "vless": ["security", "flow", "type", "encryption", "sni"],
+    "hysteria2": ["sni", "insecure", "obfs", "alpn", "auth", "ca", "udp"],
+    "hysteria": ["peer", "insecure"],
+    "tuic": ["mode", "insecure"]
+}
+
+# ======================
+# 工具函数
+# ======================
+def normalize_uri(uri: str):
+    """标准化 URI：协议头小写，查询参数排序"""
+    parsed = urlparse(uri)
+    scheme = parsed.scheme.lower()
+    if scheme not in ALLOWED_PROTOCOLS:
+        return None
+    query_params = sorted(parse_qsl(parsed.query))
+    new_query = urlencode(query_params) if query_params else ""
+    return urlunparse((scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+def hash_uri(uri: str):
+    """生成 URI 哈希，保证去重稳定"""
+    return hashlib.md5(uri.encode()).hexdigest()
+
+# ======================
+# 协议解析插件
+# ======================
+def parse_vless(node):
+    uuid = node.get('uuid', '')
     server = node.get('server', '')
-    port = node.get('port', '')
-    password = node.get('password', node.get('uuid', '')) # 部分配置用uuid当密码
-    
-    # 构建基础 URI
+    port = int(node.get('port', 443))
+    params = {k: node.get(k) for k in ALLOWED_PARAMS["vless"] if node.get(k)}
+    query = urlencode(params) if params else ""
+    return urlunparse(('vless', f'{uuid}@{server}:{port}', '', '', query, ''))
+
+def parse_hysteria2(node):
+    server = node.get('server', '')
+    port = int(node.get('port', 443))
+    password = node.get('password', node.get('uuid', ''))
+    params = {k: node.get(k) for k in ALLOWED_PARAMS["hysteria2"] if node.get(k)}
+    query = urlencode(sorted(params.items())) if params else ""
     base = f"hysteria2://{password}@{server}:{port}"
-    
-    # 提取参数
-    params = {}
-    if node.get('sni'): params['sni'] = node['sni']
-    if node.get('insecure'): params['insecure'] = '1'
-    if node.get('obfs'): params['obfs'] = node['obfs']
-    
-    query = urllib.parse.urlencode(params)
     return f"{base}?{query}" if query else base
 
+def parse_hysteria(node):
+    server = node.get('server', '')
+    port = int(node.get('port', 443))
+    params = {k: node.get(k) for k in ALLOWED_PARAMS["hysteria"] if node.get(k)}
+    query = urlencode(params) if params else ""
+    base = f"hysteria://{server}:{port}"
+    return f"{base}?{query}" if query else base
+
+def parse_tuic(node):
+    server = node.get('server', '')
+    port = int(node.get('port', 443))
+    params = {k: node.get(k) for k in ALLOWED_PARAMS["tuic"] if node.get(k)}
+    query = urlencode(params) if params else ""
+    base = f"tuic://{server}:{port}"
+    return f"{base}?{query}" if query else base
+
+# 协议插件字典
+PARSERS = {
+    "vless": parse_vless,
+    "hysteria2": parse_hysteria2,
+    "hy2": parse_hysteria2,  # 兼容别名
+    "hysteria": parse_hysteria,
+    "tuic": parse_tuic
+}
+
+# ======================
+# 核心处理函数
+# ======================
 def to_uri(node):
-    """将结构化节点转换为完整 URI"""
-    # 1. 原生 URI 直接过滤
-    if node.get('type') == 'uri':
-        uri = node.get('uri', '')
-        return uri if uri.startswith(ALLOWED_PROTOCOLS) else None
+    """节点字典 → URI"""
+    node_type = node.get('type', '').lower()
     
-    # 2. YAML 字典还原
-    ptype = node.get('type', '').lower()
+    # 原生 URI
+    if node_type == 'uri':
+        return normalize_uri(node.get('uri', ''))
     
-    # 针对 Hysteria2 特殊还原
-    if ptype in ['hy2', 'hysteria2']:
-        return format_hysteria2(node)
+    # 协议插件解析
+    parser = PARSERS.get(node_type)
+    if parser:
+        return normalize_uri(parser(node))
     
-    # 针对 VLESS 等其他协议的通用还原
-    if ptype == 'vless':
-        uuid = node.get('uuid', '')
-        server = node.get('server', '')
-        port = node.get('port', 443)
-        return f"vless://{uuid}@{server}:{port}"
-        
     return None
 
-def main():
+# ======================
+# 节点处理框架
+# ======================
+def process_nodes(input_file='all_nodes.yaml', output_dir='output'):
     try:
-        with open('all_nodes.yaml', 'r', encoding="utf-8") as f:
+        if not os.path.exists(input_file):
+            raise FileNotFoundError(f"未找到文件: {input_file}")
+        
+        with open(input_file, 'r', encoding='utf-8') as f:
             nodes = yaml.safe_load(f)
         
-        if not isinstance(nodes, list): nodes = []
-
-        uris = []
+        if not nodes or not isinstance(nodes, list):
+            raise ValueError("YAML 文件为空或根结构不是 list")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        seen_hashes = set()
+        outputs = {p: [] for p in ALLOWED_PROTOCOLS}
+        
         for n in nodes:
             uri = to_uri(n)
-            if uri: uris.append(uri)
+            if uri:
+                h = hash_uri(uri)
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                
+                scheme = urlparse(uri).scheme
+                outputs.setdefault(scheme, []).append(uri)
+                
+                if DEBUG:
+                    print(f"[DEBUG] {scheme} -> {uri}")
         
-        with open('all_nodes.txt', 'w', encoding="utf-8") as f:
-            f.write('\n'.join(sorted(set(uris))))
+        # 输出不同协议文件
+        total = 0
+        for scheme, lst in outputs.items():
+            if not lst:
+                continue
+            filename = os.path.join(output_dir, f"{scheme}_nodes.txt")
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lst))
+            total += len(lst)
         
-        print(f"转换完成，共生成 {len(set(uris))} 条完整 URI")
+        print(f"转换完成，总计 {total} 条标准化 URI，输出到 {output_dir}/")
+    
     except Exception as e:
-        print(f"转换失败: {e}")
+        print(f"执行失败: {e}")
 
+# ======================
+# CLI 入口
+# ======================
 if __name__ == '__main__':
-    main()
+    process_nodes()
