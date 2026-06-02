@@ -3,8 +3,8 @@ name: Fetch Subscriptions
 on:
   push:
     paths:
-      - '.github/workflows/generate_nodes.yml' # 监控工作流文件改动
-      - 'main.py'                            # 监控脚本改动
+      - '.github/workflows/fetch.yaml' # 监控工作流文件改动
+      - 'w38.py'                            # 监控脚本改动
   workflow_dispatch:
   schedule:
     # 北京时间每天 00:00 和 12:00 运行 (UTC 16:00 和 04:00)
