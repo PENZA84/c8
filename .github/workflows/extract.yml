@@ -4,16 +4,18 @@ on:
   push:
     paths:
       - 'deep_extract.py'
+      - 'converter.py'
       - 'latest.yaml'
   schedule:
-    - cron: '0 0 * * *' # 北京时间 08:00 运行
+    # 北京时间每天 08:00 运行 (UTC 00:00)
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
   extract:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须赋予写入权限
+      contents: write # 必须赋予写入权限以提交代码
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,14 +32,18 @@ jobs:
       - name: Run extraction script
         run: python deep_extract.py
 
+      - name: Convert to URI list
+        run: python converter.py
+
       - name: Commit and push changes
         run: |
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
-          # 检查文件是否有变动
-          if [ -n "$(git status --porcelain all_nodes.yaml)" ]; then
-            git add all_nodes.yaml
-            git commit -m "Auto-update: sync nodes from deep_extract.py [$(date '+%Y-%m-%d %H:%M:%S')]"
+          
+          # 检查是否有文件更新
+          if [ -n "$(git status --porcelain all_nodes.yaml all_nodes.txt)" ]; then
+            git add all_nodes.yaml all_nodes.txt
+            git commit -m "Auto-update nodes: $(date '+%Y-%m-%d %H:%M:%S')"
             git push
           else
             echo "No changes to commit."
