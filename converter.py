@@ -100,7 +100,7 @@ def to_uri(node):
 # ======================
 # 节点处理框架
 # ======================
-def process_nodes(input_file='all_nodes.yaml', output_dir='output'):
+def process_nodes(input_file='all_nodes.yaml', output_file='all_nodes.txt'):
     try:
         if not os.path.exists(input_file):
             raise FileNotFoundError(f"未找到文件: {input_file}")
@@ -111,10 +111,8 @@ def process_nodes(input_file='all_nodes.yaml', output_dir='output'):
         if not nodes or not isinstance(nodes, list):
             raise ValueError("YAML 文件为空或根结构不是 list")
         
-        os.makedirs(output_dir, exist_ok=True)
-        
         seen_hashes = set()
-        outputs = {p: [] for p in ALLOWED_PROTOCOLS}
+        final_uris = []
         
         for n in nodes:
             uri = to_uri(n)
@@ -124,31 +122,16 @@ def process_nodes(input_file='all_nodes.yaml', output_dir='output'):
                     continue
                 seen_hashes.add(h)
                 
-                scheme = urlparse(uri).scheme
-                outputs.setdefault(scheme, []).append(uri)
+                final_uris.append(uri)
                 
                 if DEBUG:
-                    print(f"[DEBUG] {scheme} -> {uri}")
+                    print(f"[DEBUG] {urlparse(uri).scheme} -> {uri}")
         
-        # 输出不同协议文件
-        total = 0
-        for scheme, lst in outputs.items():
-            if not lst:
-                continue
-            filename = os.path.join(output_dir, f"{scheme}_nodes.txt")
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lst))
-            total += len(lst)
+        # 直接输出到 all_nodes.txt
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(final_uris))
         
-        # 合并输出到 all_nodes.txt
-        with open('all_nodes.txt', 'w', encoding='utf-8') as f_out:
-            for scheme in ALLOWED_PROTOCOLS:
-                filename = os.path.join(output_dir, f"{scheme}_nodes.txt")
-                if os.path.exists(filename):
-                    with open(filename, 'r', encoding='utf-8') as f_in:
-                        f_out.write(f_in.read() + '\n')
-        
-        print(f"转换完成，总计 {total} 条标准化 URI，已生成分流文件及 all_nodes.txt")
+        print(f"转换完成，总计 {len(final_uris)} 条标准化 URI，已生成 {output_file}")
     
     except Exception as e:
         print(f"执行失败: {e}")
